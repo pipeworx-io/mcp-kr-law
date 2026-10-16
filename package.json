@@ -1,0 +1,32 @@
+{
+  "name": "@pipeworx/mcp-kr-law",
+  "version": "0.1.0",
+  "description": "Korea Law MCP — South Korean national statutes via the Ministry of Government Legislation's (법제처) National Law Information Center Open API (open.law.go.kr).",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "bin": {
+    "mcp-kr-law": "bin/cli.js"
+  },
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "kr-law"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pipeworx-io/mcp-kr-law.git"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-d2544724a20c392d39680491969b4bbc123dacae1d3bfe7fd85a9ede38a230cb",
+    "sourceCommit": "fe38188882d0fe91e5a45d82b7b989b4aae1e8b6"
+  }
+}
