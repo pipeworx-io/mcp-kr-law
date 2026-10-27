@@ -4,7 +4,7 @@ South Korean national statutes: search by title, fetch one article (조문) at
 a time with its own effective date, and a statute's revision history. Bring
 your own OC (Open API user id) — every call runs on your own registration.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1815+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1882+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -72,12 +72,17 @@ The public demo id does not have this entitlement at all.
 - A law's own `시행일자` (effective date) and one specific article's
   `조문시행일자` can differ — an amendment sometimes only moves one article's
   effective date forward. Both are returned, kept separate.
-- **www.law.go.kr is itself Cloudflare-fronted and intermittently answers a
-  legitimate request with HTTP 522/524/503** (measured live, 2026-10-15: 1 of
-  20 real calls). Every tool retries up to 3 times with backoff before giving
-  up; if the origin is still down after that, the error says plainly that
-  Korea's law service did not respond and to try again — never a bare
-  Cloudflare status code or its "error code: 5xx" body text.
+- **www.law.go.kr is itself Cloudflare-fronted and blocks a Cloudflare
+  Worker's own egress specifically** (measured live, 2026-10-16: through the
+  gateway only 2 of 10 calls succeeded, while a non-CF vantage got 10 of 10).
+  Every call is routed through the Pipeworx egress relay, the same
+  mechanism as `mcps/oklahoma-code`/`mcps/utah-code` — with a direct-call
+  fallback if the relay itself is misconfigured, since direct egress does
+  sometimes succeed here. Every tool also retries up to 3 times with
+  backoff on a 522/524/503 before giving up; if nothing responds after
+  that, the error says plainly that Korea's law service did not respond and
+  to try again — never a bare Cloudflare status code or its
+  "error code: 5xx" body text.
 
 ## Quick Start
 
@@ -123,7 +128,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1815+ data sources. The
+Both URLs reach the same gateway and the same 1882+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

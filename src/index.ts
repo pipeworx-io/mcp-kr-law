@@ -295,10 +295,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -670,6 +686,254 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
 /**
  * Korea Law MCP — South Korean national statutes via the Ministry of
  * Government Legislation's (법제처) National Law Information Center Open API
@@ -743,6 +1007,26 @@ function collapse(s: string): string {
  * retry/backoff behaviour itself has no live fixture to prove against (it
  * only fires on an upstream blip, not on demand), but the exhausted-retry
  * message IS proven to never leak the raw "error code: 5xx" body.
+ *
+ * EGRESS RELAY (fleet #3128, second follow-up, 2026-10-16). The retry above
+ * helps but does not fix the root cause: Cloudflare's own edge is blocking
+ * (or badly throttling) a Cloudflare WORKER's egress to www.law.go.kr
+ * specifically, not the origin being slow. Measured live same day: through
+ * the gateway (Cloudflare egress), 2 of 10 kr_law_search calls succeeded;
+ * from machine 0 directly, 10 of 10 in ~1s each; through a throwaway
+ * Supabase Edge Function on the SAME non-CF runtime the shared egress relay
+ * uses, 10 of 10 in well under 1.5s each. Same class of hop as
+ * oklahoma-code/utah-code (mcps/oklahoma-code/src/index.ts, fleet #2742) —
+ * an IP-reputation block, not a TLS-chain issue, so no PINNED_CA entry is
+ * needed, only the host allow-listed in `supabase/functions/egress-proxy`.
+ * `relayFrom`/`relaySelfError` below are the identical mechanism oklahoma-code
+ * uses: the gateway injects `_proxyUrl`/`_proxyToken` for this slug
+ * (workers/gateway/src/index.ts), and `pwFetchWithRetry` routes through the
+ * relay when present, falling back to a DIRECT call — within the same
+ * attempt, not a wasted retry — if the relay itself reports a configuration
+ * error (bad token, host not yet allow-listed) rather than an upstream
+ * response. Absent `_proxyUrl`/`_proxyToken` (local dev, or a gateway build
+ * predating this change), every call goes direct exactly as before.
  */
 
 
@@ -753,6 +1037,60 @@ const OC_HELP = 'https://open.law.go.kr/LSO/main.do (로그인 -> OPEN API -> OP
 async function pwFetch(url: string | URL, init?: RequestInit, timeoutMs?: number): Promise<Response> {
   const headers = { 'User-Agent': UA, ...(init?.headers ?? {}) };
   return fetchWithTimeout(url, { ...init, headers }, 'Korea Law (MOLEG Open API)', timeoutMs);
+}
+
+// ── Egress relay (same mechanism as mcps/oklahoma-code and mcps/utah-code) ─
+
+/** `_proxyUrl`/`_proxyToken`, injected by the gateway for this slug exactly
+ *  as for oklahoma-code/utah-code — see workers/gateway/src/index.ts. Absent
+ *  (local dev, or a gateway build that predates this fix) every call falls
+ *  back to a direct fetch. */
+type Relay = { url: string; token: string } | null;
+
+function relayFrom(args: Record<string, unknown>): Relay {
+  const url = (args._proxyUrl as string | undefined)?.trim();
+  const token = (args._proxyToken as string | undefined)?.trim();
+  return url && token ? { url, token } : null;
+}
+
+async function pwFetchViaRelay(url: string | URL, relay: NonNullable<Relay>, timeoutMs?: number): Promise<Response> {
+  // The relay forwards the target verbatim and returns the upstream
+  // response status/body unchanged. userAgent must be passed explicitly —
+  // the relay strips caller headers by design.
+  return fetchWithTimeout(
+    relay.url,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${relay.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: String(url), userAgent: UA }),
+    },
+    'Korea Law (MOLEG Open API) via the Pipeworx egress relay',
+    timeoutMs,
+  );
+}
+
+/** The relay synthesizes exactly these `{error}` bodies for a request that
+ *  never reached www.law.go.kr at all — a dead bearer token, the host not
+ *  yet allow-listed. Every one of those is OUR configuration and must never
+ *  be read as "Korea's law service refused the request" (same reasoning as
+ *  mcps/oklahoma-code's RELAY_SELF_ERRORS / mcps/utah-code's). */
+const RELAY_SELF_ERRORS = new Set(['unauthorized', 'bad_request', 'bad_url', 'host_not_allowed', 'method_not_allowed']);
+
+async function relaySelfError(res: Response, relay: Relay): Promise<string | null> {
+  if (!relay || res.ok) return null;
+  let body: unknown;
+  try {
+    body = await res.clone().json();
+  } catch {
+    return null;
+  }
+  const code = (body as { error?: unknown } | null)?.error;
+  if (typeof code !== 'string' || !RELAY_SELF_ERRORS.has(code)) return null;
+  return markInternalOrigin(
+    `Pipeworx egress relay refused the request (${code}) — this is our own relay configuration, not law.go.kr. See supabase/functions/egress-proxy.`,
+    relay.url,
+    500,
+  );
 }
 
 /**
@@ -778,10 +1116,31 @@ async function pwFetch(url: string | URL, init?: RequestInit, timeoutMs?: number
 const RETRYABLE_STATUSES = new Set([522, 524, 503]);
 const RETRY_TIMEOUT_MS = 6_000;
 
-async function pwFetchWithRetry(url: string | URL, init?: RequestInit, attempts = 3): Promise<Response> {
+/** One fetch, preferring the relay when configured. If the relay itself is
+ *  broken for this request — a self-error JSON body, or the relay call
+ *  itself throwing (network failure reaching the Supabase function) — falls
+ *  back to a DIRECT call for this same attempt rather than wasting a whole
+ *  retry cycle on a hop that was never going to work. This is NOT the
+ *  oklahoma-code/utah-code behaviour (those throw the self-error loudly as
+ *  our own fault) — kr-law's measured baseline shows direct egress DOES
+ *  sometimes succeed (2 of 10 through the gateway, before this fix), so
+ *  falling back here can still answer the call instead of refusing outright. */
+async function fetchOnce(url: string | URL, relay: Relay): Promise<Response> {
+  if (relay) {
+    try {
+      const res = await pwFetchViaRelay(url, relay, RETRY_TIMEOUT_MS);
+      if (!(await relaySelfError(res, relay))) return res;
+    } catch {
+      // Relay call itself threw — fall through to a direct attempt below.
+    }
+  }
+  return pwFetch(url, undefined, RETRY_TIMEOUT_MS);
+}
+
+async function pwFetchWithRetry(url: string | URL, relay: Relay, attempts = 3): Promise<Response> {
   for (let i = 0; i < attempts; i++) {
     try {
-      const res = await pwFetch(url, init, RETRY_TIMEOUT_MS);
+      const res = await fetchOnce(url, relay);
       if (res.ok || !RETRYABLE_STATUSES.has(res.status) || i === attempts - 1) return res;
     } catch (err) {
       // Rethrown VERBATIM on the last attempt — fetchWithTimeout's own error
@@ -817,9 +1176,9 @@ export function requireOc(tool: string, args: Record<string, unknown>): string {
   return key.trim();
 }
 
-async function lawGet(path: 'lawSearch.do' | 'lawService.do', oc: string, params: Record<string, string>): Promise<string> {
+async function lawGet(path: 'lawSearch.do' | 'lawService.do', oc: string, params: Record<string, string>, relay: Relay): Promise<string> {
   const qs = new URLSearchParams({ OC: oc, type: 'XML', ...params });
-  const res = await pwFetchWithRetry(`${BASE}/${path}?${qs.toString()}`);
+  const res = await pwFetchWithRetry(`${BASE}/${path}?${qs.toString()}`, relay);
   const body = await res.text();
   if (!res.ok) {
     // Still a retryable status after pwFetchWithRetry's attempts are spent —
@@ -926,7 +1285,7 @@ export async function searchLaws(oc: string, args: Record<string, unknown>) {
   // historical-only search target, so "historical"/"all" both search the
   // general law target and the caller filters on the returned "status" field.
   const target = args.status === 'current' ? 'eflaw' : 'law';
-  const body = await lawGet('lawSearch.do', oc, { target, query, display: String(display), page: String(page) });
+  const body = await lawGet('lawSearch.do', oc, { target, query, display: String(display), page: String(page) }, relayFrom(args));
   const totalCnt = Number(textOf(body, 'totalCnt') ?? '0');
   const laws = extractAll(body, 'law').map((block) => ({
     law_id: textOf(block, '법령ID'),
@@ -988,7 +1347,7 @@ export function renderArticleText(articleTitle: string | undefined, hangs: HangI
 export async function getArticle(oc: string, args: Record<string, unknown>) {
   const mst = String(args.mst ?? '').trim();
   if (!mst) throw new Error('Required argument "mst" is missing — get it from kr_law_search\'s "mst" field for the law you want.');
-  const body = await lawGet('lawService.do', oc, { target: 'law', MST: mst });
+  const body = await lawGet('lawService.do', oc, { target: 'law', MST: mst }, relayFrom(args));
 
   const lawMeta = {
     law_id: textOf(body, '법령ID'),
@@ -1095,7 +1454,7 @@ export function sliceByKey(body: string, keyTag: string): string[] {
 export async function getHistory(oc: string, args: Record<string, unknown>) {
   const mst = String(args.mst ?? '').trim();
   if (!mst) throw new Error('Required argument "mst" is missing — get it from kr_law_search\'s "mst" field for the law you want.');
-  const body = await lawGet('lawService.do', oc, { target: 'lsHistory', MST: mst });
+  const body = await lawGet('lawService.do', oc, { target: 'lsHistory', MST: mst }, relayFrom(args));
 
   const rows = sliceByKey(body, '법령일련번호').map((b) => ({
     mst: textOf(b, '법령일련번호'),
