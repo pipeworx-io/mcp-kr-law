@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/kr-law",
   "title": "Kr Law",
   "description": "Korea Law MCP — South Korean national statutes via the Ministry of Government Legislation's (법제처)…",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "websiteUrl": "https://pipeworx.io/packs/kr-law",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-kr-law",
